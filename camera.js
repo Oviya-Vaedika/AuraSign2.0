@@ -1,305 +1,219 @@
+
 (() => {
   "use strict";
 
   const app = window.AuraApp;
-  const $ = app.$;
+  const $ = (selector) => document.querySelector(selector);
 
   const video = $("#cameraVideo");
   const canvas = $("#cameraCanvas");
   const ctx = canvas.getContext("2d");
 
-  const recognized = $("#recognizedText");
+  const output = $("#recognizedText");
   const log = $("#detectionLog");
   const placeholder = $("#cameraPlaceholder");
 
+  const status = $("#cameraMessage");
+  const confidence = $("#confidencePill");
+  const cameraState = $("#cameraState");
+
   let stream = null;
-  let handModel = null;
-  let raf = 0;
+  let model = null;
   let active = false;
-  let detectBusy = false;
-  let lastDetect = 0;
-  let mediapipeBase = "https://cdn.jsdelivr.net/npm/@mediapipe/hands/";
+  let busy = false;
+  let raf = 0;
+  let lastFrame = 0;
+  let lastLandmarkSignature = "";
+  let signatureSince = 0;
 
-  // Recognition stability state for each visible hand.
-  const handStates = new Map();
-  let sessionEntries = 0;
+  // Temporal data for training a future motion classifier.
+  const WINDOW_SIZE = 30;
+  let motionWindow = [];
+  let trainingSamples = [];
 
-  const MAX_HISTORY = 30;
-  const DETECTION_INTERVAL = 40;
-  const STABILITY_MS = 450;
-  const REPEAT_COOLDOWN_MS = 1400;
-
-  const fingerPaths = [
-    [0, 1, 2, 3, 4],
-    [0, 5, 6, 7, 8],
-    [0, 9, 10, 11, 12],
-    [0, 13, 14, 15, 16],
-    [0, 17, 18, 19, 20],
-    [5, 9, 13, 17]
+  const connections = [
+    [0, 1], [1, 2], [2, 3], [3, 4],
+    [0, 5], [5, 6], [6, 7], [7, 8],
+    [0, 9], [9, 10], [10, 11], [11, 12],
+    [0, 13], [13, 14], [14, 15], [15, 16],
+    [0, 17], [17, 18], [18, 19], [19, 20],
+    [5, 9], [9, 13], [13, 17]
   ];
 
   function setStatus(message) {
-    $("#cameraMessage").textContent = message;
+    if (status) status.textContent = message;
   }
 
-  function setPill(message) {
-    $("#confidencePill").textContent = message;
+  function setConfidence(message) {
+    if (confidence) confidence.textContent = message;
   }
 
-  function setCameraState(message) {
-    $("#cameraState").textContent = message;
+  function setState(message) {
+    if (cameraState) cameraState.textContent = message;
   }
 
-  function sizeCanvas() {
+  function resizeCanvas() {
+    if (!canvas) return;
+
     const rect = canvas.getBoundingClientRect();
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-
     if (!rect.width || !rect.height) return;
 
-    canvas.width = Math.max(1, Math.round(rect.width * dpr));
-    canvas.height = Math.max(1, Math.round(rect.height * dpr));
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+    canvas.width = Math.round(rect.width * dpr);
+    canvas.height = Math.round(rect.height * dpr);
 
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
   function clearOverlay() {
+    if (!canvas) return;
+
     const rect = canvas.getBoundingClientRect();
     ctx.clearRect(0, 0, rect.width, rect.height);
   }
 
-  function drawHand(landmarks, handIndex) {
+  function drawHands(hands) {
+    clearOverlay();
+
     const rect = canvas.getBoundingClientRect();
     const width = rect.width;
     const height = rect.height;
 
-    const points = landmarks.map(point => ({
-      x: point.x * width,
-      y: point.y * height
-    }));
+    hands.forEach((landmarks, handIndex) => {
+      const points = landmarks.map((p) => ({
+        x: p.x * width,
+        y: p.y * height
+      }));
 
-    // Draw the palm and fingers.
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.strokeStyle = handIndex === 0 ? "#22d3ee" : "#f0abfc";
+      ctx.lineWidth = 3;
 
-    fingerPaths.forEach((path, index) => {
-      ctx.beginPath();
-
-      path.forEach((pointIndex, position) => {
-        const point = points[pointIndex];
-
-        if (position === 0) {
-          ctx.moveTo(point.x, point.y);
-        } else {
-          ctx.lineTo(point.x, point.y);
-        }
+      connections.forEach(([a, b]) => {
+        ctx.beginPath();
+        ctx.moveTo(points[a].x, points[a].y);
+        ctx.lineTo(points[b].x, points[b].y);
+        ctx.stroke();
       });
 
-      ctx.strokeStyle =
-        index === 0
-          ? "#f0abfc"
-          : index === 5
-            ? "rgba(224,251,255,0.8)"
-            : "#22d3ee";
+      points.forEach((p, index) => {
+        const fingertip = [4, 8, 12, 16, 20].includes(index);
 
-      ctx.lineWidth = index === 5 ? 2.5 : 3.5;
-      ctx.shadowColor = ctx.strokeStyle;
-      ctx.shadowBlur = 5;
-      ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, fingertip ? 5 : 2.8, 0, Math.PI * 2);
+        ctx.fillStyle = fingertip ? "#ffffff" : "#a5f3fc";
+        ctx.fill();
+      });
     });
-
-    ctx.shadowBlur = 0;
-
-    // Draw joints and fingertips.
-    points.forEach((point, index) => {
-      const isTip = [4, 8, 12, 16, 20].includes(index);
-
-      ctx.beginPath();
-      ctx.arc(point.x, point.y, isTip ? 5 : 2.5, 0, Math.PI * 2);
-      ctx.fillStyle = isTip ? "#f0abfc" : "#ffffff";
-      ctx.fill();
-
-      ctx.lineWidth = 1.2;
-      ctx.strokeStyle = "#07506a";
-      ctx.stroke();
-    });
-
-    // Label each hand without treating it as a translated sign.
-    const wrist = points[0];
-    ctx.font = "600 12px sans-serif";
-    ctx.fillStyle = "#f0abfc";
-    ctx.fillText(`Hand ${handIndex + 1}`, wrist.x + 8, wrist.y + 18);
   }
 
-  const distance = (a, b) =>
-    Math.hypot(a.x - b.x, a.y - b.y);
+  // Normalize coordinates around the wrist and divide by palm size.
+  // This reduces variation caused by the hand being closer to the camera.
+  // It does NOT remove every camera angle or handedness difference.
+  function normalizeLandmarks(landmarks) {
+    if (!landmarks || landmarks.length !== 21) return null;
 
-  /*
-   * Stage 1: estimate a basic hand shape.
-   *
-   * These labels are NOT ISL words or signs.
-   * This is a geometric heuristic, not a trained sign classifier.
-   */
-  function estimateHandShape(points) {
-    if (!points || points.length < 21) {
-      return {
-        label: "Landmarks unavailable",
-        detail: "Waiting for valid hand landmarks."
-      };
+    const wrist = landmarks[0];
+    const middleBase = landmarks[9];
+
+    const palmScale = Math.hypot(
+      middleBase.x - wrist.x,
+      middleBase.y - wrist.y,
+      middleBase.z - wrist.z
+    );
+
+    if (!Number.isFinite(palmScale) || palmScale < 0.0001) {
+      return null;
     }
 
-    const wrist = points[0];
-    const palmSize = Math.max(distance(points[0], points[9]), 0.001);
+    return landmarks.flatMap((point) => [
+      (point.x - wrist.x) / palmScale,
+      (point.y - wrist.y) / palmScale,
+      (point.z - wrist.z) / palmScale
+    ]);
+  }
 
-    /*
-     * Estimate finger extension using relative distances.
-     * This is less dependent on image scale than fixed pixel thresholds,
-     * but can still fail with rotated hands and unusual camera angles.
-     */
-    function isFingerExtended(tipIndex, pipIndex, mcpIndex) {
-      const tipFromWrist = distance(points[tipIndex], wrist);
-      const pipFromWrist = distance(points[pipIndex], wrist);
-      const mcpFromWrist = distance(points[mcpIndex], wrist);
+  function buildFrame(results) {
+    const hands = results.multiHandLandmarks || [];
+    const handedness = results.multiHandedness || [];
 
-      return (
-        tipFromWrist > pipFromWrist + palmSize * 0.12 &&
-        tipFromWrist > mcpFromWrist + palmSize * 0.25
-      );
-    }
-
-    const thumbExtended =
-      distance(points[4], points[5]) >
-      distance(points[3], points[5]) * 1.12;
-
-    const fingers = [
-      isFingerExtended(8, 6, 5),
-      isFingerExtended(12, 10, 9),
-      isFingerExtended(16, 14, 13),
-      isFingerExtended(20, 18, 17)
-    ];
-
-    const [index, middle, ring, pinky] = fingers;
-    const count = fingers.filter(Boolean).length;
-
-    let label = "Unclassified hand shape";
-
-    if (count === 4) {
-      label = "Open-palm shape";
-    } else if (count === 0 && !thumbExtended) {
-      label = "Closed-fist shape";
-    } else if (index && !middle && !ring && !pinky) {
-      label = "One-finger-extended shape";
-    } else if (index && middle && !ring && !pinky) {
-      label = "Two-fingers-extended shape";
-    } else if (!index && middle && !ring && !pinky) {
-      label = "Middle-finger-extended shape";
-    } else if (pinky && !index && !middle && !ring) {
-      label = "Pinky-extended shape";
-    } else if (thumbExtended && count === 0) {
-      label = "Thumb-extended shape";
-    } else if (count === 3) {
-      label = "Three-fingers-extended shape";
-    }
-
-    return {
-      label,
-      detail: `${count} of 4 fingers estimated extended; thumb ${
-        thumbExtended ? "extended" : "folded or uncertain"
-      }.`
+    const frame = {
+      time: Math.round(performance.now()),
+      hands: []
     };
+
+    hands.forEach((landmarks, index) => {
+      const normalized = normalizeLandmarks(landmarks);
+      if (!normalized) return;
+
+      const label =
+        handedness[index]?.classification?.[0]?.label || "Unknown";
+
+      frame.hands.push({
+        handedness: label,
+        landmarks: normalized
+      });
+    });
+
+    return frame;
   }
 
-  function getHandConfidence(results, index) {
-    const classification = results.multiHandedness?.[index]?.[0];
-    const score = classification?.score;
-
-    if (typeof score !== "number") return null;
-
-    return Math.round(score * 100);
+  function signatureFor(frame) {
+    // Rounded landmark signature is only for stability tracking.
+    // It is not a sign classifier.
+    return JSON.stringify(
+      frame.hands.map((hand) =>
+        hand.landmarks.map((value) => Math.round(value * 8) / 8)
+      )
+    );
   }
 
-  function renderHistoryMessage() {
-    if (sessionEntries === 0) {
-      recognized.textContent =
-        "No stable hand shapes detected yet. Hold your hand steady in the frame.";
+  function updateStatus(frame) {
+    if (!frame.hands.length) {
+      setState("SEARCHING");
+      setConfidence("NO HAND");
+      log.textContent =
+        "No hand detected. Improve lighting and keep your hands in frame.";
+      lastLandmarkSignature = "";
+      signatureSince = 0;
+      motionWindow = [];
+      return;
     }
-  }
 
-  function addHistoryEntry(text) {
-    if (sessionEntries === 0) {
-      recognized.replaceChildren();
+    motionWindow.push(frame);
+    if (motionWindow.length > WINDOW_SIZE) {
+      motionWindow.shift();
     }
 
-    const entry = document.createElement("span");
-    entry.className = "recognized-entry";
-    entry.textContent = text;
-
-    recognized.append(entry, document.createTextNode("  "));
-    sessionEntries++;
-
-    // Keep the session output from growing indefinitely.
-    while (recognized.children.length > MAX_HISTORY) {
-      recognized.removeChild(recognized.firstElementChild);
-    }
-  }
-
-  function updateRecognition(points, handIndex, detectorConfidence) {
-    const result = estimateHandShape(points);
+    const signature = signatureFor(frame);
     const now = performance.now();
 
-    let state = handStates.get(handIndex);
-
-    if (!state) {
-      state = {
-        candidate: "",
-        candidateSince: now,
-        committedLabel: "",
-        committedAt: 0
-      };
-
-      handStates.set(handIndex, state);
+    if (signature !== lastLandmarkSignature) {
+      lastLandmarkSignature = signature;
+      signatureSince = now;
     }
 
-    const confidenceText =
-      detectorConfidence === null
-        ? "Detector score unavailable"
-        : `Hand detector score: ${detectorConfidence}%`;
+    const stable = now - signatureSince >= 350;
 
-    const labelText = `Hand ${handIndex + 1}: ${result.label}`;
+    setState(stable ? "TRACKING · STABLE" : "TRACKING");
+    setConfidence(`${frame.hands.length} HAND${frame.hands.length > 1 ? "S" : ""}`);
 
-    if (result.label !== state.candidate) {
-      state.candidate = result.label;
-      state.candidateSince = now;
+    log.textContent =
+      `${frame.hands.length} hand(s) tracked · ` +
+      `${motionWindow.length}/${WINDOW_SIZE} motion frames collected. ` +
+      "No sign prediction has been made.";
+  }
+
+  function showTrackingNotice() {
+    if (!output) return;
+
+    if (!output.textContent.trim() ||
+        /hold a hand pose|recognized gestures will appear/i.test(output.textContent)) {
+      output.textContent =
+        "Hand landmarks are tracked. ISL recognition model not connected yet.";
     }
-
-    const stableLongEnough =
-      now - state.candidateSince >= STABILITY_MS;
-
-    const changedLabel = result.label !== state.committedLabel;
-
-    const cooldownPassed =
-      now - state.committedAt >= REPEAT_COOLDOWN_MS;
-
-    if (
-      stableLongEnough &&
-      changedLabel &&
-      (cooldownPassed || state.committedLabel === "")
-    ) {
-      state.committedLabel = result.label;
-      state.committedAt = now;
-
-      addHistoryEntry(
-        `${new Date().toLocaleTimeString()} — ${labelText}`
-      );
-    }
-
-    const stabilityText = stableLongEnough
-      ? "Shape estimate stable"
-      : "Stabilizing shape estimate…";
-
-    return {
-      label: result.label,
-      detail: `${labelText}. ${result.detail} ${confidenceText}. ${stabilityText}`
-    };
   }
 
   async function loadHandsLibrary() {
@@ -307,13 +221,11 @@
 
     const sources = [
       {
-        script:
-          "https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js",
+        script: "https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js",
         base: "https://cdn.jsdelivr.net/npm/@mediapipe/hands/"
       },
       {
-        script:
-          "https://unpkg.com/@mediapipe/hands/hands.js",
+        script: "https://unpkg.com/@mediapipe/hands/hands.js",
         base: "https://unpkg.com/@mediapipe/hands/"
       }
     ];
@@ -322,83 +234,40 @@
       try {
         await new Promise((resolve, reject) => {
           const script = document.createElement("script");
-
           script.src = source.script;
           script.async = true;
           script.onload = resolve;
-          script.onerror = () => {
-            script.remove();
-            reject(new Error("Hand-tracking library failed to load."));
-          };
-
+          script.onerror = () => reject(
+            new Error("Could not load MediaPipe Hands.")
+          );
           document.head.appendChild(script);
         });
 
         if (window.Hands) {
-          mediapipeBase = source.base;
-          return true;
+          return source.base;
         }
       } catch (error) {
-        console.warn("Aura Sign model loader:", error);
+        console.warn(error);
       }
     }
 
-    return false;
-  }
-
-  function resetHandStates() {
-    handStates.clear();
-  }
-
-  function handleResults(results) {
-    if (!active) return;
-
-    const hands = results.multiHandLandmarks || [];
-    const handedness = results.multiHandedness || [];
-
-    clearOverlay();
-
-    if (hands.length === 0) {
-      resetHandStates();
-
-      setPill("NO HAND DETECTED");
-      setCameraState("SEARCHING");
-
-      log.textContent =
-        "No hand detected. Try better lighting and keep your hands inside the camera frame.";
-
-      return;
-    }
-
-    let logLines = [];
-
-    hands.forEach((landmarks, index) => {
-      drawHand(landmarks, index);
-
-      const confidence = getHandConfidence(results, index);
-      const result = updateRecognition(landmarks, index, confidence);
-
-      logLines.push(result.detail);
-    });
-
-    setCameraState("HAND TRACKING");
-    setPill(`${hands.length} HAND${hands.length === 1 ? "" : "S"} FOUND`);
-
-    log.textContent = logLines.join("\n");
+    throw new Error(
+      "Could not load the hand-tracking library. Check your internet connection."
+    );
   }
 
   async function start() {
     if (active) return;
 
     if (!navigator.mediaDevices?.getUserMedia) {
-      setStatus(
-        "Camera access requires HTTPS or localhost. Open the deployed site securely and allow camera access."
-      );
-      app.toast("Camera access is unavailable in this context.");
+      setStatus("Use HTTPS or localhost and allow camera access.");
       return;
     }
 
-    $("#startCamera").disabled = true;
+    const startButton = $("#startCamera");
+    const stopButton = $("#stopCamera");
+
+    if (startButton) startButton.disabled = true;
     setStatus("Requesting camera permission…");
 
     try {
@@ -413,49 +282,43 @@
 
       video.srcObject = stream;
       video.style.display = "block";
-
       await video.play();
 
-      sizeCanvas();
-      placeholder.style.display = "none";
+      const base = await loadHandsLibrary();
 
-      setStatus("Loading the hand-tracking model…");
-
-      const loaded = await loadHandsLibrary();
-
-      if (!loaded) {
-        throw new Error(
-          "The hand-tracking library could not load. Check your internet connection or CDN access."
-        );
-      }
-
-      handModel = new window.Hands({
-        locateFile: file => `${mediapipeBase}${file}`
+      model = new window.Hands({
+        locateFile: (file) => `${base}${file}`
       });
 
-      handModel.setOptions({
+      model.setOptions({
         maxNumHands: 2,
         modelComplexity: 1,
         minDetectionConfidence: 0.65,
-        minTrackingConfidence: 0.6
+        minTrackingConfidence: 0.65
       });
 
-      handModel.onResults(handleResults);
+      model.onResults((results) => {
+        if (!active) return;
+
+        const hands = results.multiHandLandmarks || [];
+        drawHands(hands);
+
+        const frame = buildFrame(results);
+        updateStatus(frame);
+
+        if (frame.hands.length) showTrackingNotice();
+      });
 
       active = true;
-      detectBusy = false;
-      lastDetect = 0;
-      resetHandStates();
+      if (placeholder) placeholder.style.display = "none";
+      if (stopButton) stopButton.disabled = false;
 
-      $("#stopCamera").disabled = false;
-
+      resizeCanvas();
+      setState("SEARCHING");
+      setConfidence("LOOKING FOR HAND");
       setStatus(
-        "Camera ready. Show one or both hands clearly. Hold a pose briefly for a stable shape estimate."
+        "Tracking ready. This version collects landmarks; it does not yet identify ISL signs."
       );
-
-      setCameraState("SEARCHING");
-      setPill("LOOKING FOR HAND");
-      log.textContent = "Waiting for hand landmarks…";
 
       loop();
     } catch (error) {
@@ -464,39 +327,20 @@
       active = false;
 
       if (stream) {
-        stream.getTracks().forEach(track => track.stop());
+        stream.getTracks().forEach((track) => track.stop());
       }
 
       stream = null;
       video.srcObject = null;
       video.style.display = "none";
-      placeholder.style.display = "flex";
 
-      $("#startCamera").disabled = false;
-      $("#stopCamera").disabled = true;
+      if (placeholder) placeholder.style.display = "flex";
+      if (startButton) startButton.disabled = false;
+      if (stopButton) stopButton.disabled = true;
 
-      setCameraState("CAMERA ERROR");
-      setPill("CAMERA ERROR");
-
-      if (error.name === "NotAllowedError") {
-        setStatus(
-          "Camera permission denied. Allow camera access in your browser settings, then try again."
-        );
-      } else if (error.name === "NotFoundError") {
-        setStatus(
-          "No camera was found. Connect a camera or try another device."
-        );
-      } else if (error.name === "NotReadableError") {
-        setStatus(
-          "The camera may be in use by another application. Close that application and try again."
-        );
-      } else {
-        setStatus(
-          `${error.message || "Camera setup failed"} Check HTTPS, internet access, and browser permissions.`
-        );
-      }
-
-      app.toast("Camera setup failed. See the message below the preview.");
+      setState("CAMERA ERROR");
+      setStatus(error.message || "Camera setup failed.");
+      app?.toast?.("Camera setup failed. Read the camera message.");
     }
   }
 
@@ -504,112 +348,174 @@
     if (!active) return;
 
     if (
-      handModel &&
+      model &&
       video.readyState >= 2 &&
-      !detectBusy &&
-      performance.now() - lastDetect >= DETECTION_INTERVAL
+      !busy &&
+      performance.now() - lastFrame >= 33
     ) {
-      lastDetect = performance.now();
-      detectBusy = true;
+      lastFrame = performance.now();
+      busy = true;
 
       try {
-        await handModel.send({ image: video });
+        await model.send({ image: video });
       } catch (error) {
-        console.warn("Aura Sign skipped a camera frame:", error);
+        console.warn("Frame skipped:", error);
       } finally {
-        detectBusy = false;
+        busy = false;
       }
     }
 
-    if (active) {
-      raf = requestAnimationFrame(loop);
-    }
+    if (active) raf = requestAnimationFrame(loop);
   }
 
-  async function stop() {
+  function stop() {
     active = false;
 
-    if (raf) {
-      cancelAnimationFrame(raf);
-    }
-
+    if (raf) cancelAnimationFrame(raf);
     raf = 0;
 
     if (stream) {
-      stream.getTracks().forEach(track => track.stop());
+      stream.getTracks().forEach((track) => track.stop());
     }
 
     stream = null;
-    video.srcObject = null;
-    video.style.display = "none";
 
-    const modelToClose = handModel;
-    handModel = null;
+    if (video) {
+      video.srcObject = null;
+      video.style.display = "none";
+    }
 
-    if (modelToClose) {
+    if (model) {
       try {
-        await modelToClose.close();
+        model.close();
       } catch (error) {
-        console.warn("Could not close the hand model cleanly:", error);
+        console.warn(error);
       }
     }
 
-    resetHandStates();
+    model = null;
+    busy = false;
+    motionWindow = [];
+    lastLandmarkSignature = "";
+
     clearOverlay();
 
-    placeholder.style.display = "flex";
+    if (placeholder) placeholder.style.display = "flex";
 
-    setCameraState("CAMERA OFF");
-    setPill("CAMERA OFF");
-    setStatus(
-      "Camera stopped. Restart it when you are ready to continue."
-    );
+    setState("CAMERA OFF");
+    setConfidence("CAMERA OFF");
+    setStatus("Camera stopped.");
 
-    $("#startCamera").disabled = false;
-    $("#stopCamera").disabled = true;
+    const startButton = $("#startCamera");
+    const stopButton = $("#stopCamera");
+
+    if (startButton) startButton.disabled = false;
+    if (stopButton) stopButton.disabled = true;
   }
 
-  $("#startCamera").addEventListener("click", start);
-  $("#stopCamera").addEventListener("click", stop);
+  // Collect a labelled example for future model training.
+  // This stores coordinates, not a claim that the label is correct.
+  function captureExample(label, kind = "alphabet") {
+    const cleanLabel = String(label || "").trim().toUpperCase();
 
-  $("#clearRecognized").addEventListener("click", () => {
-    recognized.replaceChildren();
-    sessionEntries = 0;
-    resetHandStates();
+    if (!cleanLabel) {
+      app?.toast?.("Enter a label first.");
+      return false;
+    }
 
-    renderHistoryMessage();
-    log.textContent = "Session output cleared.";
+    if (!motionWindow.length) {
+      app?.toast?.("Start the camera and show your hand first.");
+      return false;
+    }
 
-    app.toast("Recognition history cleared.");
-  });
+    trainingSamples.push({
+      schemaVersion: 1,
+      language: "ISL",
+      kind,
+      label: cleanLabel,
+      capturedAt: new Date().toISOString(),
+      frameCount: motionWindow.length,
+      frames: motionWindow.map((frame) => ({
+        hands: frame.hands.map((hand) => ({
+          handedness: hand.handedness,
+          landmarks: [...hand.landmarks]
+        }))
+      }))
+    });
 
-  $("#copyRecognized").addEventListener("click", async () => {
-    const text = recognized.textContent.trim();
+    app?.toast?.(`Captured example ${trainingSamples.length}.`);
+    return true;
+  }
 
-    if (!text || sessionEntries === 0) {
-      app.toast("There is no recognition history to copy yet.");
+  function downloadDataset() {
+    if (!trainingSamples.length) {
+      app?.toast?.("Capture some labelled examples first.");
       return;
     }
 
+    const dataset = {
+      format: "aura-sign-landmarks-v1",
+      note:
+        "User-labelled examples. Verify every label against a reliable ISL reference before training.",
+      samples: trainingSamples
+    };
+
+    const blob = new Blob(
+      [JSON.stringify(dataset, null, 2)],
+      { type: "application/json" }
+    );
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+
+    link.href = url;
+    link.download = "aura-sign-training-data.json";
+    link.click();
+
+    URL.revokeObjectURL(url);
+    app?.toast?.(`Exported ${trainingSamples.length} examples.`);
+  }
+
+  function clearDataset() {
+    trainingSamples = [];
+    app?.toast?.("Captured training examples cleared.");
+  }
+
+  $("#startCamera")?.addEventListener("click", start);
+  $("#stopCamera")?.addEventListener("click", stop);
+
+  $("#clearRecognized")?.addEventListener("click", () => {
+    if (output) {
+      output.textContent =
+        "Hand landmarks are tracked. ISL recognition model not connected yet.";
+    }
+
+    if (log) log.textContent = "No detections yet.";
+    app?.toast?.("Output cleared.");
+  });
+
+  $("#copyRecognized")?.addEventListener("click", async () => {
     try {
-      await navigator.clipboard.writeText(text);
-      app.toast("Recognition history copied.");
-    } catch (error) {
-      app.toast(
-        "Clipboard access unavailable. Select and copy the text manually."
-      );
+      await navigator.clipboard.writeText(output?.textContent || "");
+      app?.toast?.("Text copied.");
+    } catch {
+      app?.toast?.("Clipboard unavailable. Select and copy the text manually.");
     }
   });
 
-  window.addEventListener("resize", sizeCanvas);
+  window.addEventListener("resize", resizeCanvas);
+  window.addEventListener("beforeunload", stop);
 
-  window.addEventListener("beforeunload", () => {
-    if (stream) {
-      stream.getTracks().forEach(track => track.stop());
-    }
-  });
+  window.AuraCamera = {
+    start,
+    stop,
+    normalizeLandmarks,
+    captureExample,
+    downloadDataset,
+    clearDataset,
+    getSampleCount: () => trainingSamples.length,
+    getMotionWindow: () => motionWindow.map((frame) => structuredClone(frame))
+  };
 
-  sizeCanvas();
-
-  window.AuraCamera = { start, stop };
+  resizeCanvas();
 })();
